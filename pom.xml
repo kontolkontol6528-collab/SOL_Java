@@ -11,11 +11,11 @@
     </properties>
 
     <dependencies>
-        <!-- solanaj for derivation and base58 utilities -->
+        <!-- BouncyCastle for Ed25519 key operations -->
         <dependency>
-            <groupId>org.p2p</groupId>
-            <artifactId>solanaj</artifactId>
-            <version>1.15</version>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk15on</artifactId>
+            <version>1.70</version>
         </dependency>
 
         <!-- Jackson for JSON parsing -->
