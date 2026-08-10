@@ -2,11 +2,13 @@ package com.solscanner;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.p2p.solanaj.crypto.DerivationPath;
-import org.p2p.solanaj.crypto.KeyPair;
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters;
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters;
 
+import javax.crypto.Mac;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -15,13 +17,16 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -87,7 +92,6 @@ public class SolScanner {
             System.out.flush();
         }, 0, 1, TimeUnit.SECONDS);
 
-        // keep main alive
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println();
             System.out.println("Shutting down...");
@@ -95,7 +99,6 @@ public class SolScanner {
             status.shutdownNow();
         }));
 
-        // block forever
         Thread.currentThread().join();
     }
 
@@ -106,7 +109,6 @@ public class SolScanner {
                     .filter(s -> !s.isEmpty())
                     .collect(Collectors.toList());
         }
-        // try resource
         InputStream is = SolScanner.class.getClassLoader().getResourceAsStream("bip39.txt");
         if (is != null) {
             try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
@@ -130,15 +132,14 @@ public class SolScanner {
             tries.incrementAndGet();
             if (!isValidBip39(candidate)) continue;
 
-            // valid mnemonic -> derive Solana address
             String mnemonic = String.join(" ", candidate);
             try {
                 byte[] seed = mnemonicToSeed(mnemonic, "");
 
-                // Derive using solanaj DerivationPath
-                // Using path exactly: m/44'/501'/0'/0
-                KeyPair kp = DerivationPath.deriveEd25519KeyPair(seed, "m/44'/501'/0'/0");
-                String address = kp.getPublicKey().toBase58();
+                // Derive using SLIP-0010 + ed25519 (Phantom-compatible)
+                byte[] derivedPrivSeed = derivePrivateKeyFromSeed(seed, "m/44'/501'/0'/0'");
+                byte[] pubKey = ed25519PublicFromPrivateSeed(derivedPrivSeed);
+                String address = Base58.encode(pubKey);
 
                 long lamports = getBalance(address);
                 double sol = lamports / 1_000_000_000.0;
@@ -146,10 +147,9 @@ public class SolScanner {
                     hits.incrementAndGet();
                     appendHit(mnemonic, address, String.valueOf(sol) + "SOL (" + lamports + " lamports)");
                 } else {
-                    // no balance, continue
+                    // no balance
                 }
             } catch (Exception e) {
-                // log derivation errors and continue
                 System.err.println("Error during derivation/check for mnemonic: " + mnemonicSnippet(candidate));
                 e.printStackTrace();
             }
@@ -166,10 +166,10 @@ public class SolScanner {
 
     private boolean isValidBip39(List<String> mnemonicWords) throws Exception {
         int n = mnemonicWords.size();
-        if (n % 3 != 0) return false; // BIP39 word count must be multiple of 3 (12,15,18,21,24)
+        if (n % 3 != 0) return false;
 
         int bits = n * 11;
-        int checksumLength = bits / 33; // entropy/32, entropy = bits - checksum
+        int checksumLength = bits / 33;
         int entropyLength = bits - checksumLength;
 
         StringBuilder bitsBuilder = new StringBuilder();
@@ -210,13 +210,56 @@ public class SolScanner {
         String salt = "mnemonic" + (passphrase == null ? "" : passphrase);
         PBEKeySpec spec = new PBEKeySpec(mnemonic.toCharArray(), salt.getBytes(StandardCharsets.UTF_8), 2048, 512);
         SecretKeyFactory skf = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA512");
-        byte[] key = skf.generateSecret(spec).getEncoded();
+        return skf.generateSecret(spec).getEncoded();
+    }
+
+    // ---------- SLIP-0010 / Ed25519 helpers ----------
+
+    private static byte[] hmacSha512(byte[] key, byte[] data) throws GeneralSecurityException {
+        Mac mac = Mac.getInstance("HmacSHA512");
+        mac.init(new SecretKeySpec(key, "HmacSHA512"));
+        return mac.doFinal(data);
+    }
+
+    /**
+     * Derive a 32-byte Ed25519 private key seed using SLIP-0010 with key "ed25519 seed".
+     * The method treats path indices as hardened (sets the hardened bit).
+     */
+    private static byte[] derivePrivateKeyFromSeed(byte[] seed, String path) throws GeneralSecurityException {
+        byte[] I = hmacSha512("ed25519 seed".getBytes(StandardCharsets.UTF_8), seed);
+        byte[] key = Arrays.copyOfRange(I, 0, 32);
+        byte[] chainCode = Arrays.copyOfRange(I, 32, 64);
+
+        String[] parts = path.split("/");
+        for (int i = 1; i < parts.length; i++) {
+            String p = parts[i];
+            String numberStr = p.endsWith("'") ? p.substring(0, p.length() - 1) : p;
+            int idx = Integer.parseInt(numberStr);
+            int childIndex = idx | 0x80000000;
+
+            ByteBuffer data = ByteBuffer.allocate(1 + 32 + 4);
+            data.put((byte) 0x00);
+            data.put(key);
+            data.putInt(childIndex);
+
+            I = hmacSha512(chainCode, data.array());
+            key = Arrays.copyOfRange(I, 0, 32);
+            chainCode = Arrays.copyOfRange(I, 32, 64);
+        }
         return key;
     }
 
+    private static byte[] ed25519PublicFromPrivateSeed(byte[] privSeed) {
+        Ed25519PrivateKeyParameters priv = new Ed25519PrivateKeyParameters(privSeed, 0);
+        Ed25519PublicKeyParameters pub = priv.generatePublicKey();
+        return pub.getEncoded();
+    }
+
+    // ---------- RPC with retry/backoff (kept from previous impl) ----------
+
     private long getBalance(String address) {
         final int maxRetries = 5;
-        final long baseDelayMs = 500L; // initial backoff
+        final long baseDelayMs = 500L;
 
         String req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBalance\",\"params\":[\"" + address + "\"]}";
 
@@ -233,7 +276,6 @@ public class SolScanner {
                 if (status != 200) {
                     String body = resp.body();
                     System.err.println("RPC error for address " + address + ": HTTP " + status + " - response: " + body);
-                    // Retry on server errors or rate limits
                     if ((status >= 500 && status < 600) || status == 429) {
                         backoffSleep(attempt, baseDelayMs);
                         continue;
@@ -245,7 +287,6 @@ public class SolScanner {
                 if (root.has("error")) {
                     String err = root.get("error").toString();
                     System.err.println("RPC returned error for address " + address + ": " + err);
-                    // treat some errors as transient
                     if (err.toLowerCase().contains("rate") || err.toLowerCase().contains("limit") || err.toLowerCase().contains("timeout")) {
                         backoffSleep(attempt, baseDelayMs);
                         continue;
@@ -282,7 +323,6 @@ public class SolScanner {
 
     private void backoffSleep(int attempt, long baseDelayMs) {
         long delay = baseDelayMs * (1L << (attempt - 1));
-        // add jitter +/- up to 100-300ms
         long jitter = ThreadLocalRandom.current().nextLong(100, 301);
         long sleepMs = delay + jitter;
         try {
